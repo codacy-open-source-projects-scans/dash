@@ -79,8 +79,6 @@ struct parsefile *parsefile = &basepf;	/* current input file */
 int whichprompt;		/* 1 == PS1, 2 == PS2 */
 int stdin_istty = -1;
 
-MKINIT void input_init(void);
-
 STATIC void pushfile(void);
 static void popstring(void);
 static int preadfd(void);
@@ -185,7 +183,7 @@ static int stdin_tee(void *buf, int nr)
 
 	flush_tee(buf, nr, stdin_state.pending);
 
-	err = tee(0, stdin_state.pip[1], nr, 0);
+	err = USE_TEE ? tee(0, stdin_state.pip[1], nr, 0) : -1;
 	stdin_state.pending = err;
 	return err;
 }
@@ -386,6 +384,7 @@ eof:
 
 again:
 		nr = q - parsefile->nextc;
+		input_set_lleft(parsefile, nr);
 		more = preadfd();
 		q = parsefile->nextc + nr;
 		if (more <= 0) {
