@@ -64,11 +64,10 @@
 
 MKINIT
 struct stdin_state {
-	tcflag_t canon;
 	off_t seekable;
-	struct termios tios;
 	int pip[2];
 	int pending;
+	tcflag_t bufferable;
 };
 
 MKINIT struct parsefile basepf;	/* top level input file */
@@ -133,12 +132,17 @@ POSTEXITRESET {
 void input_init(void)
 {
 	struct stdin_state *st = &stdin_state;
+	struct termios tios;
 	int istty;
 
-	istty = tcgetattr(0, &st->tios) + 1;
-	st->seekable = istty ? 0 : lseek(0, 0, SEEK_CUR) + 1;
-	st->canon = istty ? st->tios.c_lflag & ICANON : 0;
+	istty = tcgetattr(0, &tios) + 1;
 	stdin_istty = istty;
+	if (istty)
+		st->bufferable = tios.c_lflag & ICANON;
+	else {
+		st->seekable = lseek(0, 0, SEEK_CUR) + 1;
+		st->bufferable = !!st->seekable;
+	}
 }
 
 static bool stdin_bufferable(void)
@@ -148,7 +152,7 @@ static bool stdin_bufferable(void)
 	if (stdin_istty < 0)
 		input_init();
 
-	return st->canon || st->seekable;
+	return st->bufferable;
 }
 
 static void flush_tee(void *buf, int nr, int pending)
@@ -166,13 +170,8 @@ static int stdin_tee(void *buf, int nr)
 {
 	int err;
 
-	if (stdin_istty)
-		return 0;
-
 	if (!stdin_state.pip[0]) {
-		err = pipe(stdin_state.pip);
-		if (err < 0)
-			return err;
+		sh_pipe(stdin_state.pip, 0);
 		if (stdin_state.pip[0] < 10)
 			stdin_state.pip[0] = savefd(stdin_state.pip[0],
 						    stdin_state.pip[0]);
@@ -218,26 +217,6 @@ static void freestrings(struct strpush *sp)
 }
 
 
-static int __pgetc(void)
-{
-	int c;
-
-	if (parsefile->unget) {
-		long unget = -(long)(unsigned)parsefile->unget--;
-
-		return parsefile->nextc[unget];
-	}
-
-	if (parsefile->nleft > 0) {
-		parsefile->nleft--;
-		c = (signed char)*parsefile->nextc++;
-	} else
-		c = preadbuffer();
-
-	return c;
-}
-
-
 /*
  * Read a character from the script, returning PEOF on end of file.
  * Nul characters in the input are silently discarded.
@@ -246,11 +225,39 @@ static int __pgetc(void)
 int __attribute__((noinline)) pgetc(void)
 {
 	struct strpush *sp = parsefile->spfree;
+	int c;
 
 	if (unlikely(sp))
 		freestrings(sp);
 
-	return __pgetc();
+again:
+	if (parsefile->unget) {
+		long unget = -(long)(unsigned)parsefile->unget--;
+
+		return (signed char)parsefile->nextc[unget];
+	}
+
+nextc:
+	if (likely(parsefile->nleft > 0)) {
+		parsefile->nleft--;
+		c = (signed char)*parsefile->nextc++;
+	} else if (unlikely(parsefile->strpush)) {
+		popstring();
+		/* The freestrings call must be delayed til the next
+		 * pgetc call for PEOA to work properly.
+		 */
+		goto again;
+	} else
+		c = preadbuffer();
+
+	/* delete nul characters */
+	if (IS_DEFINED_SMALL && unlikely(!c)) {
+		parsefile->nextc = memmove(parsefile->nextc - 1,
+					   parsefile->nextc, parsefile->nleft);
+		goto nextc;
+	}
+
+	return c;
 }
 
 int pgetc_eoa(void)
@@ -276,6 +283,7 @@ preadfd(void)
 {
 	char *buf = parsefile->buf;
 	int fd = parsefile->fd;
+	bool use_tee;
 	int unget;
 	int pnr;
 	int nr;
@@ -294,6 +302,12 @@ preadfd(void)
 	nr = BUFSIZ - nr;
 	if (!IS_DEFINED_SMALL && !nr)
 		return nr;
+
+	use_tee = likely(!fd) &&
+#ifndef SMALL
+		  !el &&
+#endif
+		  !stdin_bufferable();
 
 	pnr = nr;
 retry:
@@ -326,12 +340,13 @@ retry:
 	}
 #endif
 
-	if (!fd && !stdin_bufferable()) {
+	if (likely(use_tee)) {
 		nr = stdin_tee(buf, nr);
-		fd = stdin_state.pip[0];
-		if (nr < 0 && errno == EINVAL) {
-			fd = 0;
-			nr = 1;
+		if (nr >= 0)
+			fd = stdin_state.pip[0];
+		else if (errno == EINVAL) {
+			use_tee = false;
+			nr = pnr = 1;
 		}
 	}
 
@@ -367,10 +382,6 @@ static int preadbuffer(void)
 	int more;
 	char *q;
 
-	if (unlikely(parsefile->strpush)) {
-		popstring();
-		return __pgetc();
-	}
 	if (parsefile->eof & 2) {
 eof:
 		parsefile->eof = 3;
@@ -401,6 +412,12 @@ again:
 		}
 	}
 
+	if (IS_DEFINED_SMALL) {
+		q += more;
+		more = 0;
+		goto done;
+	}
+
 	/* delete nul characters */
 	for (;;) {
 		int c;
@@ -414,9 +431,6 @@ again:
 		}
 
 		q++;
-
-		if (IS_DEFINED_SMALL)
-			goto check;
 
 		switch (c) {
 		case '\n':
@@ -432,11 +446,8 @@ again:
 		}
 
 check:
-		if (more <= 0) {
-			if (!IS_DEFINED_SMALL)
-				goto again;
-			break;
-		}
+		if (more <= 0)
+			goto again;
 	}
 done:
 	input_set_lleft(parsefile, more);

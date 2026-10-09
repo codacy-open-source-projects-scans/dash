@@ -56,6 +56,7 @@ static char  **gargv;
 
 #include "bltin.h"
 #include "parser.h"
+#include "syntax.h"
 #include "system.h"
 
 #define PF(f, func) { \
@@ -332,6 +333,7 @@ unsigned conv_escape(char *str0, char *out0, bool mbchar)
 	char *out = out0;
 	char *str = str0;
 	unsigned value;
+	int och;
 	int ch;
 
 	ch = *str;
@@ -349,7 +351,7 @@ unsigned conv_escape(char *str0, char *out0, bool mbchar)
 
 		value = '\\';
 
-		if (isodigit(ch)) {
+		if (unlikely(isodigit(ch))) {
 			ch = 3;
 			value = 0;
 			do {
@@ -359,12 +361,22 @@ unsigned conv_escape(char *str0, char *out0, bool mbchar)
 		}
 
 		str--;
+
+check_value:
+		if (SQSYNTAX[(signed char)value] != CCTL)
+			break;
+		/* fall through */
+
+	case '\\':
+		if (mbchar)
+			USTPUTC(CTLESC, out);
 		break;
 
 	case 'x':
 		ch = 2;
 
 hex:
+		och = ch;
 		value = 0;
 		do {
 			int c = *++str;
@@ -388,8 +400,11 @@ hex:
 			value += d;
 		} while (--ch);
 
+		if (och <= 2)
+			goto check_value;
+
 		if (value < 0x80)
-			break;
+			goto check_value;
 
 		if (value < 0x110000) {
 			int mboff = (mbchar - 1) * 2;
@@ -419,7 +434,7 @@ hex:
 			USTPUTC(CTLMBCHAR, out);
 			USTPUTC(len, out);
 			STADJUST(mboff, out);
-			*(uint32_t *)out = value;
+			memcpy(out, &value, 4);
 			STADJUST(len, out);
 			USTPUTC(len, out);
 			USTPUTC(CTLMBCHAR, out);
@@ -431,9 +446,6 @@ hex:
 	case 'u':
 		ch = 4;
 		goto hex;
-
-	case '\\':
-		break;
 
 	case 'a':				/* alert */
 	case 'b':				/* backspace */
